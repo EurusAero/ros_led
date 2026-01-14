@@ -1,11 +1,15 @@
 <launch>
     <node pkg="ws281x" name="led" type="ws281x_node" clear_params="true" output="screen">
+        <!-- Количество светодиодов -->
         <param name="led_count" value="30"/>
-        <param name="gpio_pin" value="21"/>
-        <param name="brightness" value="255"/>
+
+        <!-- Устройство SPI. Проверьте ls /dev/spidev*, обычно это spidev0.0 или spidev1.0 -->
+        <param name="spi_device" value="/dev/spidev4.1"/>
+
+        <!-- Тип ленты. Для обычной WS2812B это обычно WS2811_STRIP_GRB -->
         <param name="strip_type" value="WS2811_STRIP_GRB"/>
-        <param name="target_frequency" value="800000"/>
-        <param name="dma" value="10"/>
-        <param name="invert" value="false"/>
+
+        <!-- Яркость (0-255) -->
+        <param name="brightness" value="255"/>
     </node>
 </launch>
