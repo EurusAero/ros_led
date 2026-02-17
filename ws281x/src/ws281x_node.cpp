@@ -1,7 +1,6 @@
 /*
  * ws281x LED strip ROS driver for Orange Pi 5 (SPI based)
- * Based on original code by Copter Express Technologies
- * Ported to Linux SPI
+ * Ported to match Python 2.4MHz Oversampling method
  */
 
 #include <ros/ros.h>
@@ -22,18 +21,14 @@
 #include <unordered_map>
 #include <algorithm>
 
-
-// SPI Speed for WS2812B emulation (approx 8MHz allows 1 byte per bit emulation)
-// 0 bit: 0b11000000 (High ~0.25us) - actually at 8MHz 1 bit is 125ns.
-// We need T0H ~350ns, T0L ~800ns. T1H ~700ns, T1L ~600ns.
-// At 8MHz:
-// 0 code: 11100000 (3 bits high = 375ns, 5 bits low = 625ns) -> Total 1000ns
-// 1 code: 11111100 (6 bits high = 750ns, 2 bits low = 250ns) -> Total 1000ns
-// This is within tolerance for WS2812B.
-
-constexpr uint32_t SPI_SPEED_HZ = 8000000;
-constexpr uint8_t SPI_BYTE_0 = 0b11100000;
-constexpr uint8_t SPI_BYTE_1 = 0b11111100;
+// ==========================================
+// SPI SETTINGS (MATCHING PYTHON DRIVER)
+// ==========================================
+// Частота 2.4 МГц позволяет кодировать 1 бит WS2812 тремя битами SPI
+// 0 -> 100 (0x4)
+// 1 -> 110 (0x6)
+constexpr uint32_t SPI_SPEED_HZ = 2400000;
+constexpr uint32_t RESET_TIME_US = 300; // 300us reset (Safe for WS2812B)
 
 enum StripType {
     STRIP_RGB = 0,
@@ -56,13 +51,17 @@ struct PixelColor {
 class WS2812SPI {
 public:
     WS2812SPI() : fd_(-1), num_leds_(0), brightness_(255) {
-        // Initialize gamma table to linear by default
+        // Инициализация гамма-таблицы (линейная по умолчанию)
         for (int i = 0; i < 256; i++) gamma_table_[i] = i;
+        
+        // Генерация таблицы перекодировки (как в Python скрипте)
+        // 1 байт цвета -> 3 байта SPI
+        generateLookupTable();
     }
 
     ~WS2812SPI() {
         if (fd_ >= 0) {
-            // Turn off leds on exit
+            // Выключаем диоды при выходе
             std::fill(pixels_.begin(), pixels_.end(), PixelColor{0,0,0,0});
             render();
             close(fd_);
@@ -74,13 +73,12 @@ public:
         type_ = type;
         pixels_.resize(num_leds, {0, 0, 0, 0});
 
-        // Determine bytes per pixel based on type
         is_rgbw_ = (type_ >= STRIP_RGBW);
-        int bytes_per_pixel = is_rgbw_ ? 4 : 3;
-
-        // Resize SPI buffer: (num_leds * bytes_per_pixel * 8 bits_per_byte) + reset_padding
-        size_t spi_len = num_leds * bytes_per_pixel * 8;
-        spi_buffer_.resize(spi_len + 100, 0); // +100 bytes for reset signal (low)
+        // 1 пиксель = (3 или 4 цвета) * 3 байта SPI на каждый цвет
+        int spi_bytes_per_pixel = (is_rgbw_ ? 4 : 3) * 3;
+        
+        // Ресайз буфера
+        spi_buffer_.resize(num_leds * spi_bytes_per_pixel);
 
         fd_ = open(device.c_str(), O_RDWR);
         if (fd_ < 0) {
@@ -123,42 +121,37 @@ public:
     bool render() {
         if (fd_ < 0) return false;
 
-        int buf_idx = 0;
+        size_t buf_idx = 0;
+        
         for (const auto& p : pixels_) {
-            // Apply brightness and gamma
+            // Применяем яркость и гамму
             uint8_t r = gamma_table_[(p.r * brightness_) >> 8];
             uint8_t g = gamma_table_[(p.g * brightness_) >> 8];
             uint8_t b = gamma_table_[(p.b * brightness_) >> 8];
             uint8_t w = gamma_table_[(p.w * brightness_) >> 8];
 
-            uint32_t color_ordered = 0;
+            // Определяем порядок цветов и заполняем буфер используя lookup table
+            // На каждый компонент цвета уходит 3 байта в буфере SPI
+            
+            // Helper lambda to append 3 bytes
+            auto append_byte = [&](uint8_t val) {
+                spi_buffer_[buf_idx++] = lookup_table_[val][0];
+                spi_buffer_[buf_idx++] = lookup_table_[val][1];
+                spi_buffer_[buf_idx++] = lookup_table_[val][2];
+            };
 
-            // Map logical colors to strip order
             switch (type_) {
-                case STRIP_RGB: color_ordered = (r << 16) | (g << 8) | b; break;
-                case STRIP_RBG: color_ordered = (r << 16) | (b << 8) | g; break;
-                case STRIP_GRB: color_ordered = (g << 16) | (r << 8) | b; break;
-                case STRIP_GBR: color_ordered = (g << 16) | (b << 8) | r; break;
-                case STRIP_BRG: color_ordered = (b << 16) | (r << 8) | g; break;
-                case STRIP_BGR: color_ordered = (b << 16) | (g << 8) | r; break;
-                case STRIP_RGBW: color_ordered = (r << 24) | (g << 16) | (b << 8) | w; break;
-                case STRIP_SK6812_GRBW: color_ordered = (g << 24) | (r << 16) | (b << 8) | w; break;
-                default: color_ordered = (g << 16) | (r << 8) | b; break; // Default GRB
-            }
-
-            int bits_to_send = is_rgbw_ ? 32 : 24;
-
-            // Convert bits to SPI bytes (MSB first)
-            for (int i = bits_to_send - 1; i >= 0; i--) {
-                if ((color_ordered >> i) & 1) {
-                    spi_buffer_[buf_idx++] = SPI_BYTE_1;
-                } else {
-                    spi_buffer_[buf_idx++] = SPI_BYTE_0;
-                }
+                case STRIP_RGB: append_byte(r); append_byte(g); append_byte(b); break;
+                case STRIP_RBG: append_byte(r); append_byte(b); append_byte(g); break;
+                case STRIP_GRB: append_byte(g); append_byte(r); append_byte(b); break; // Стандартный WS2812
+                case STRIP_GBR: append_byte(g); append_byte(b); append_byte(r); break;
+                case STRIP_BRG: append_byte(b); append_byte(r); append_byte(g); break;
+                case STRIP_BGR: append_byte(b); append_byte(g); append_byte(r); break;
+                case STRIP_RGBW: append_byte(r); append_byte(g); append_byte(b); append_byte(w); break;
+                case STRIP_SK6812_GRBW: append_byte(g); append_byte(r); append_byte(b); append_byte(w); break;
+                default: append_byte(g); append_byte(r); append_byte(b); break;
             }
         }
-
-        // Reset signal is handled by the zeros at the end of vector (resize fills with 0)
 
         struct spi_ioc_transfer tr = {
             .tx_buf = (unsigned long)spi_buffer_.data(),
@@ -169,12 +162,34 @@ public:
             .bits_per_word = 8,
         };
 
-        return ioctl(fd_, SPI_IOC_MESSAGE(1), &tr) >= 0;
+        int ret = ioctl(fd_, SPI_IOC_MESSAGE(1), &tr);
+        
+        // Важно: пауза для Reset сигнала (Latch), как в Python скрипте
+        usleep(RESET_TIME_US); 
+        
+        return ret >= 0;
     }
 
     int getCount() const { return num_leds_; }
 
 private:
+    void generateLookupTable() {
+        // Создаем таблицу, где каждый байт (0-255) превращается в 3 байта SPI
+        for (int i = 0; i < 256; i++) {
+            uint32_t spi_bits = 0;
+            // Проходим по битам от старшего к младшему
+            for (int bit = 7; bit >= 0; bit--) {
+                // Если бит 1 -> паттерн 110, если 0 -> паттерн 100
+                uint8_t pattern = ((i >> bit) & 1) ? 0b110 : 0b100;
+                spi_bits = (spi_bits << 3) | pattern;
+            }
+            // Разбиваем 24 бита на 3 байта
+            lookup_table_[i][0] = (spi_bits >> 16) & 0xFF;
+            lookup_table_[i][1] = (spi_bits >> 8) & 0xFF;
+            lookup_table_[i][2] = spi_bits & 0xFF;
+        }
+    }
+
     int fd_;
     int num_leds_;
     uint8_t brightness_;
@@ -183,6 +198,9 @@ private:
     std::vector<PixelColor> pixels_;
     std::vector<uint8_t> spi_buffer_;
     uint8_t gamma_table_[256];
+    
+    // Таблица: индекс [0-255], значение [3 байта SPI]
+    uint8_t lookup_table_[256][3]; 
 };
 
 // --- SPI DRIVER IMPLEMENTATION END ---
@@ -217,7 +235,6 @@ void publishLedState()
         strip_state.leds[i].r = p.r;
         strip_state.leds[i].g = p.g;
         strip_state.leds[i].b = p.b;
-        // led_msgs/LEDState doesn't usually have W, but we store it internally
     }
     led_state_pub.publish(strip_state);
 }
@@ -235,7 +252,6 @@ bool setGamma(ws281x::SetGamma::Request& req, ws281x::SetGamma::Response& resp)
 
 bool setLeds(led_msgs::SetLEDs::Request& req, led_msgs::SetLEDs::Response& resp)
 {
-    // check validness
     for(auto const& led : req.leds) {
         if (led.index < 0 || led.index >= led_driver.getCount()) {
             ROS_ERROR("[ws281x] LED index out of bounds: %d", led.index);
@@ -245,9 +261,6 @@ bool setLeds(led_msgs::SetLEDs::Request& req, led_msgs::SetLEDs::Response& resp)
     }
 
     for(auto const& led : req.leds) {
-        // Note: led_msgs/LEDState usually doesn't have 'w', assuming RGB for now
-        // If you need W support, you might need to extend the message or use a custom one.
-        // Here we just set RGB.
         led_driver.setPixel(led.index, led.r, led.g, led.b, 0);
     }
 
@@ -266,7 +279,6 @@ bool setLeds(led_msgs::SetLEDs::Request& req, led_msgs::SetLEDs::Response& resp)
 void cleanup(int signal)
 {
     (void) signal;
-    // Destructor of led_driver will handle cleanup (turn off leds)
     ros::shutdown();
 }
 
@@ -275,31 +287,27 @@ int main(int argc, char** argv)
     ros::init(argc, argv, "ws281x");
     ros::NodeHandle nh, nh_priv("~");
 
-    // Parameters
     int param_led_count;
     int param_brightness;
     std::string param_strip_type_str;
     std::string param_spi_device;
 
-    // Unused params kept for compatibility with launch files, but warned
+    // Unused params kept for compatibility
     int param_freq, param_dma, param_pin;
     bool param_invert;
 
     nh_priv.param("led_count", param_led_count, 30);
     nh_priv.param("brightness", param_brightness, 255);
     nh_priv.param("strip_type", param_strip_type_str, std::string("WS2811_STRIP_GRB"));
-
-    // New parameter for SPI
     nh_priv.param("spi_device", param_spi_device, std::string("/dev/spidev4.1"));
 
-    // Legacy params (ignored)
     nh_priv.param("target_frequency", param_freq, 800000);
     nh_priv.param("gpio_pin", param_pin, 21);
     nh_priv.param("dma", param_dma, 10);
     nh_priv.param("invert", param_invert, false);
 
     if (nh_priv.hasParam("gpio_pin") || nh_priv.hasParam("dma")) {
-        ROS_WARN("[ws281x] 'gpio_pin', 'dma', 'invert', 'target_frequency' are ignored on Orange Pi SPI driver. Use 'spi_device'.");
+        ROS_WARN("[ws281x] Legacy params ignored. Using SPI logic (2.4MHz oversampling) on %s", param_spi_device.c_str());
     }
 
     StripType strip_type = STRIP_GRB;
@@ -310,27 +318,23 @@ int main(int argc, char** argv)
         ROS_WARN("[ws281x] Unknown strip type: %s, defaulting to GRB", param_strip_type_str.c_str());
     }
 
-    ROS_INFO("[ws281x] Initializing SPI device: %s, LEDs: %d, Type: %s",
+    ROS_INFO("[ws281x] Initializing SPI (2.4MHz): %s, LEDs: %d, Type: %s",
              param_spi_device.c_str(), param_led_count, param_strip_type_str.c_str());
 
     if (!led_driver.init(param_spi_device, param_led_count, strip_type)) {
-        ROS_FATAL("[ws281x] Failed to initialize SPI driver. Check permissions (sudo usermod -aG spi $USER) and device path.");
+        ROS_FATAL("[ws281x] Failed to initialize SPI driver. Check permissions and path.");
         return 1;
     }
 
     led_driver.setBrightness((uint8_t)param_brightness);
 
-    // Setup signals
     signal(SIGINT, cleanup);
     signal(SIGTERM, cleanup);
 
-    // Services and Publishers
     auto srv_gamma = nh_priv.advertiseService("set_gamma", setGamma);
     auto srv_leds = nh_priv.advertiseService("set_leds", setLeds);
-
     led_state_pub = nh_priv.advertise<led_msgs::LEDStateArray>("state", 1, true);
 
-    // Initial publish
     publishLedState();
 
     ros::spin();
